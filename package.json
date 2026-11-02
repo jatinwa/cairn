@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "description": "Durable execution for applications that already have Postgres.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=20.11"
