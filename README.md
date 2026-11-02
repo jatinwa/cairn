@@ -68,11 +68,24 @@ to hand to any downstream service that supports one.
 A run that cannot make progress reaches a terminal or parked state with a stated reason. It
 does not silently retry forever.
 
+## What's implemented
+
+The pure core — no I/O, no database. These are the primitives the rest is built on:
+
+| Module | Provides |
+|---|---|
+| `duration.ts` | `parseDuration("14 days")` → milliseconds, for timers and retry policies |
+| `keys.ts` | `stepKey(name, occurrence)` journal keys, and the `idempotencyKey` derived from them |
+| `retry.ts` | Retry policy resolution, and `retryDelay()` with full jitter on by default |
+| `errors.ts` | `NonRetryableError`, plus the library's own error types |
+
+Still to come: the Postgres schema, the migration runner, the worker loop, and the `step()`
+and `sleep()` functions shown above.
+
 ## Development
 
-Requirements: **Node >= 20.11**, and **Docker** for the integration tests (they start a
-throwaway Postgres via testcontainers; set `DATABASE_URL` to point at an existing server
-instead).
+Requirements: **Node >= 20.11**. Nothing else yet — the current tests are pure unit tests
+with no database. Postgres, via Docker, arrives with the storage layer.
 
 ```bash
 npm install
@@ -80,9 +93,6 @@ npm run typecheck
 npm run lint
 npm test
 ```
-
-`npm run db:up` and `npm run db:down` start and stop a local Postgres on port 5433, for
-poking at by hand.
 
 ## Licence
 
