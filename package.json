@@ -1,0 +1,48 @@
+{
+  "name": "cairn",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Durable execution for applications that already have Postgres.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:up": "docker run --rm -d --name cairn-pg -e POSTGRES_PASSWORD=cairn -e POSTGRES_DB=cairn -p 5433:5432 postgres:17-alpine",
+    "db:down": "docker rm -f cairn-pg"
+  },
+  "keywords": [
+    "durable-execution",
+    "workflow",
+    "postgres",
+    "background-jobs"
+  ],
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.14.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.0.5"
+  }
+}
