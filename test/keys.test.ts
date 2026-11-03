@@ -50,10 +50,10 @@ describe("assertStepName", () => {
     expect(() => assertStepName("charge ")).toThrow(/whitespace/);
   });
 
-  // The reason the separator is banned, stated as a test: without this rule
-  // stepKey("a#1", 0) and stepKey("a", 1) both produce "a#1", and the second
-  // step would silently read the first one's recorded result.
-  it("rejects the separator, which would otherwise let two steps collide", () => {
+  // Keys are unambiguous even with `#` in a name, because the occurrence is
+  // always appended last. The ban keeps every key splittable on a single
+  // separator, which is a tidiness guarantee rather than a safety one.
+  it("rejects the separator so that keys contain exactly one", () => {
     expect(() => stepKey("a#1", 0)).toThrow(InvalidStepNameError);
     expect(stepKey("a", 1)).toBe("a#1");
   });

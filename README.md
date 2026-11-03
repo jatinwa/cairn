@@ -70,7 +70,7 @@ does not silently retry forever.
 
 ## What's implemented
 
-The pure core — no I/O, no database. These are the primitives the rest is built on:
+The foundations. There is no worker loop yet, so nothing runs a workflow:
 
 | Module | Provides |
 |---|---|
@@ -78,14 +78,28 @@ The pure core — no I/O, no database. These are the primitives the rest is buil
 | `keys.ts` | `stepKey(name, occurrence)` journal keys, and the `idempotencyKey` derived from them |
 | `retry.ts` | Retry policy resolution, and `retryDelay()` with full jitter on by default |
 | `errors.ts` | `NonRetryableError`, plus the library's own error types |
+| `migrate.ts` | Applies the SQL schema — idempotent, and safe from several processes at once |
 
-Still to come: the Postgres schema, the migration runner, the worker loop, and the `step()`
-and `sleep()` functions shown above.
+The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
+collide with your own `run`, `step` or `task` tables. Migrating takes any client with a
+`query` method, so there is no runtime dependency on a particular driver:
+
+```ts
+import { Client } from "pg";
+import { migrate } from "cairn";
+
+const client = new Client({ connectionString: process.env.DATABASE_URL });
+await client.connect();
+await migrate(client); // safe to call on every boot
+```
+
+Still to come: the worker loop, and the `step()` and `sleep()` functions shown above.
 
 ## Development
 
-Requirements: **Node >= 20.11**. Nothing else yet — the current tests are pure unit tests
-with no database. Postgres, via Docker, arrives with the storage layer.
+Requirements: **Node >= 20.11**. Docker is optional — the database tests start a throwaway
+Postgres via testcontainers when one is available and skip themselves when it is not. Set
+`DATABASE_URL` to use a server you already have instead.
 
 ```bash
 npm install
@@ -93,6 +107,9 @@ npm run typecheck
 npm run lint
 npm test
 ```
+
+`npm run db:up` and `npm run db:down` start and stop a local Postgres on port 5433, if you
+would rather not rely on testcontainers.
 
 ## Licence
 

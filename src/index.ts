@@ -3,8 +3,20 @@ export {
   InvalidDurationError,
   InvalidRetryPolicyError,
   InvalidStepNameError,
+  MigrationChecksumError,
+  MigrationError,
   NonRetryableError,
 } from "./errors.js";
+
+export {
+  checksumOf,
+  loadMigrations,
+  migrate,
+  SCHEMA_NAME,
+  type MigrateResult,
+  type Migration,
+  type SqlExecutor,
+} from "./migrate.js";
 
 export { parseDuration, type Duration } from "./duration.js";
 

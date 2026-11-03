@@ -52,3 +52,30 @@ export class InvalidRetryPolicyError extends CairnError {
     this.name = "InvalidRetryPolicyError";
   }
 }
+
+/** A migration could not be loaded or applied. */
+export class MigrationError extends CairnError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "MigrationError";
+  }
+}
+
+/**
+ * An already-applied migration's file has changed since it ran. Editing a
+ * migration that other databases have already applied leaves them silently
+ * diverged, so this is always an error rather than a warning.
+ */
+export class MigrationChecksumError extends MigrationError {
+  readonly version: string;
+
+  constructor(version: string, expected: string, actual: string) {
+    super(
+      `Migration ${version} has already been applied, but its file has changed ` +
+        `(recorded checksum ${expected}, file is now ${actual}). ` +
+        `Add a new migration instead of editing an applied one.`,
+    );
+    this.name = "MigrationChecksumError";
+    this.version = version;
+  }
+}

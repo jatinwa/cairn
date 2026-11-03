@@ -8,16 +8,19 @@ import { InvalidStepNameError } from "./errors.js";
  */
 export const STEP_KEY_SEPARATOR = "#";
 
-/** Matches the `step.key` column width in the schema. */
+/**
+ * Longest permitted step name. The `cairn.step.key` column allows this plus
+ * the `#<occurrence>` suffix.
+ */
 export const MAX_STEP_NAME_LENGTH = 256;
 
 /**
  * Validate a step name.
  *
- * The `#` rule is not cosmetic. Journal keys are `name#occurrence`, so a name
- * containing `#` would make two different steps collide: `stepKey("a#1", 0)`
- * and `stepKey("a", 1)` would both be `"a#1"`, and the second step would read
- * the first one's recorded result instead of running.
+ * The `#` rule is a simplicity rule, not a correctness one. Because the
+ * occurrence index is always appended last, keys stay unambiguous even when a
+ * name contains `#`. Banning it means a key can be split on its only
+ * separator rather than on its last one, and keys stay readable in logs.
  *
  * @throws {InvalidStepNameError}
  */
