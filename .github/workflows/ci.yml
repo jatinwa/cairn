@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Static checks need no database and no matrix, so they run once and fail fast.
+  checks:
+    name: lint, types, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+
+      # The migrations ship as .sql files alongside the compiled output rather
+      # than being compiled into it, so they depend on `files` in package.json
+      # being right. If they fall out of the tarball, every install is broken
+      # at runtime and nothing else in this pipeline would notice.
+      - name: Published package includes the migrations
+        # `shell: bash` for pipefail. The default Linux shell is `bash -e`
+        # without it, so `npm pack | tee` would report tee's exit code.
+        shell: bash
+        run: |
+          npm pack --dry-run 2>&1 | tee "$RUNNER_TEMP/pack.txt"
+          if ! grep -q 'migrations/001_init.sql' "$RUNNER_TEMP/pack.txt"; then
+            echo "::error::migrations/001_init.sql is missing from the package tarball; migrate() would fail for every consumer."
+            exit 1
+          fi
+
+  test:
+    name: node ${{ matrix.node }}, postgres ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One combination failing should not hide the others.
+      fail-fast: false
+      matrix:
+        # Node 20 is the floor from `engines`, 24 the newest; Postgres 15 and 16
+        # guard against depending on something only 17 provides.
+        include:
+          - node: 20
+            postgres: 17
+          - node: 22
+            postgres: 17
+          - node: 24
+            postgres: 17
+          - node: 22
+            postgres: 16
+          - node: 22
+            postgres: 15
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Present, so the suite uses this service container and skips starting one
+      # of its own through testcontainers.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # Fails loudly if DATABASE_URL is wrong, rather than letting the database
+      # tests quietly skip and the job pass on 80 of 94 tests.
+      - name: Database tests must not skip
+        # `shell: bash` for pipefail — without it this step would report tee's
+        # exit code and a failing test suite would pass the job.
+        shell: bash
+        run: |
+          npm test 2>&1 | tee "$RUNNER_TEMP/test.txt"
+          if grep -qi 'Skipping database tests' "$RUNNER_TEMP/test.txt"; then
+            echo "::error::The database tests skipped, so this job proved nothing. Check DATABASE_URL and the postgres service."
+            exit 1
+          fi

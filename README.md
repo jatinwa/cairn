@@ -2,6 +2,8 @@
 
 Durable execution for applications that already have Postgres.
 
+[![CI](https://github.com/jatinwa/cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/jatinwa/cairn/actions/workflows/ci.yml)
+
 > **Status: pre-alpha. Nothing works yet.**
 > There is no runtime, no published package, and no API stability. The name is a placeholder
 > pending an npm and trademark check.
@@ -110,6 +112,9 @@ npm test
 
 `npm run db:up` and `npm run db:down` start and stop a local Postgres on port 5433, if you
 would rather not rely on testcontainers.
+
+CI runs the whole suite on Node 20, 22 and 24 against Postgres 15, 16 and 17, and fails if
+the database tests skip — a green tick means they actually ran.
 
 ## Licence
 
