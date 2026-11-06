@@ -53,6 +53,14 @@ export class InvalidRetryPolicyError extends CairnError {
   }
 }
 
+/** An argument to a public function was outside its contract. */
+export class InvalidArgumentError extends CairnError {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidArgumentError";
+  }
+}
+
 /** A migration could not be loaded or applied. */
 export class MigrationError extends CairnError {
   constructor(message: string, options?: ErrorOptions) {

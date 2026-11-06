@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { checksumOf, loadMigrations, SCHEMA_NAME, type Migration } from "../src/migrate.js";
+import { checksumOf, loadMigrations, type Migration } from "../src/migrate.js";
+import { OPEN_STATUSES_SQL, SCHEMA_NAME } from "../src/sql.js";
 
 describe("checksumOf", () => {
   it("returns 64 hex characters", () => {
@@ -66,6 +67,15 @@ describe("loadMigrations", () => {
     expect(sql).toContain(`CREATE TABLE ${SCHEMA_NAME}.run`);
     expect(sql).toContain(`CREATE TABLE ${SCHEMA_NAME}.step`);
     expect(sql).toContain(`CREATE TABLE ${SCHEMA_NAME}.task`);
+  });
+
+  // `startRun` relies on `ON CONFLICT ... WHERE <predicate>` inferring the
+  // partial unique index, which Postgres only does when the predicate it is
+  // given implies the index's own. If the two spellings drift, deduplication
+  // stops working without any error, so they are pinned together here.
+  it("spells the open-status predicate the way OPEN_STATUSES_SQL does", () => {
+    const sql = migrations.map((migration) => migration.sql).join("\n");
+    expect(sql).toContain(`WHERE ${OPEN_STATUSES_SQL}`);
   });
 
   // Index names are not schema-qualified — an index lives in its table's

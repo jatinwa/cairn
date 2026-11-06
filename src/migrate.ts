@@ -4,15 +4,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { MigrationChecksumError, MigrationError } from "./errors.js";
+import { SCHEMA_NAME, type SqlExecutor } from "./sql.js";
 
-/**
- * The minimum a database client must provide. Anything with a compatible
- * `query` works — node-postgres, a checked-out pool client, a Kysely or
- * Drizzle connection — so this library has no runtime dependency on a driver.
- */
-export interface SqlExecutor {
-  query(sql: string, values?: unknown[]): Promise<{ rows: unknown[] }>;
-}
+export { SCHEMA_NAME, type SqlExecutor };
 
 export interface Migration {
   /** Zero-padded ordering key taken from the filename, e.g. `"001"`. */
@@ -31,9 +25,6 @@ export interface MigrateResult {
   /** Versions that were already applied and were left alone. */
   readonly skipped: readonly string[];
 }
-
-/** The schema every cairn object lives in. */
-export const SCHEMA_NAME = "cairn";
 
 /**
  * Serialises concurrent migration runs. Any constant works as long as it never

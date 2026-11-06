@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import { Client } from "pg";
 
+import { migrate } from "../../src/migrate.js";
+
 const url = process.env.DATABASE_URL;
 
 /** Whether a Postgres is reachable, and so whether database tests should run. */
@@ -48,6 +50,19 @@ export async function withTemporaryDatabase<T>(
   } finally {
     await admin.end();
   }
+}
+
+/**
+ * {@link withTemporaryDatabase} with the schema already applied, for tests
+ * about behaviour rather than about migrating.
+ */
+export async function withMigratedDatabase<T>(
+  body: (database: TemporaryDatabase) => Promise<T>,
+): Promise<T> {
+  return withTemporaryDatabase(async (database) => {
+    await migrate(database.client);
+    return body(database);
+  });
 }
 
 function withDatabaseName(connectionString: string, database: string): string {

@@ -1,0 +1,388 @@
+import { parseDuration, type Duration } from "./duration.js";
+import { CairnError, InvalidArgumentError } from "./errors.js";
+import { OPEN_STATUSES_SQL, SCHEMA_NAME, type SqlExecutor } from "./sql.js";
+
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "sleeping"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "continued";
+
+/** How long a claim holds a task before another worker may take it. */
+export const DEFAULT_LEASE: Duration = "30s";
+
+/**
+ * Tasks claimed per poll. Batching is not an optimisation here: at 50 workers
+ * polling 10 times a second, one task per claim makes the claim query itself
+ * the bottleneck long before step throughput does. See design doc §9.
+ */
+export const DEFAULT_CLAIM_LIMIT = 16;
+
+/**
+ * `task.id` and `task.fence` are `bigint` columns, and node-postgres returns
+ * those as strings rather than silently losing precision past 2^53. They are
+ * opaque tokens here, never arithmetic, so strings are the honest type.
+ */
+export interface TaskLease {
+  readonly taskId: string;
+  readonly fence: string;
+}
+
+export interface ClaimedTask extends TaskLease {
+  readonly runId: string;
+  readonly queue: string;
+  /** Failed attempts so far on this task, 0 on a first claim. */
+  readonly attempt: number;
+  readonly priority: number;
+  readonly leaseUntil: Date;
+}
+
+export interface StartRunOptions {
+  readonly workflowName: string;
+  /** Deduplication key: one open run per (workflowName, workflowId). */
+  readonly workflowId: string;
+  readonly input?: unknown;
+  readonly queue?: string;
+  /** Hold the first claim until this moment. Defaults to immediately. */
+  readonly availableAt?: Date;
+  /** Higher is claimed first. Defaults to 0. */
+  readonly priority?: number;
+}
+
+export interface StartRunResult {
+  readonly runId: string;
+  /** `false` when an open run already existed and was returned instead. */
+  readonly created: boolean;
+}
+
+export interface RunRecord {
+  readonly id: string;
+  readonly workflowName: string;
+  readonly workflowId: string;
+  readonly status: RunStatus;
+  readonly input: unknown;
+  readonly output: unknown;
+  readonly error: unknown;
+  readonly stallReason: string | null;
+  readonly journalLen: number;
+  readonly createdAt: Date;
+  readonly closedAt: Date | null;
+}
+
+export interface ClaimOptions {
+  /** Identifies the claiming worker. Any UUID, stable for the worker's life. */
+  readonly workerId: string;
+  readonly queue?: string;
+  readonly leaseFor?: Duration;
+  readonly limit?: number;
+}
+
+export interface ReleaseOptions {
+  /** When the task becomes claimable again. Defaults to immediately. */
+  readonly availableAt?: Date;
+  /** New attempt count. Left unchanged when omitted. */
+  readonly attempt?: number;
+}
+
+/**
+ * Create a run and the single task that will drive it.
+ *
+ * One open run per `(workflowName, workflowId)`: concurrent starts race on the
+ * `run_open_per_workflow_id` partial unique index, one wins, and the losers get
+ * the winner's `runId` back with `created: false`. Once that run closes, the
+ * pair is free again.
+ *
+ * The run and its task are created by a single statement, so a run can never
+ * exist without a task to move it forward — which would strand it forever.
+ * Being one statement also means this is safe to call inside a transaction the
+ * caller already opened.
+ */
+export async function startRun(
+  client: SqlExecutor,
+  options: StartRunOptions,
+): Promise<StartRunResult> {
+  requireNonEmpty(options.workflowName, "workflowName");
+  requireNonEmpty(options.workflowId, "workflowId");
+
+  const queue = options.queue ?? "default";
+  requireNonEmpty(queue, "queue");
+
+  const values = [
+    options.workflowName,
+    options.workflowId,
+    options.input === undefined ? null : JSON.stringify(options.input),
+    queue,
+    options.availableAt ?? null,
+    options.priority ?? 0,
+  ];
+
+  // Three passes at most. The insert and the follow-up read are separate
+  // statements with separate snapshots: under READ COMMITTED, `ON CONFLICT DO
+  // NOTHING` sees a row another transaction has just committed, but a plain
+  // SELECT in the same statement would not. So a conflict can leave us with
+  // neither an inserted row nor a visible existing one, and the fix is to look
+  // again. A third pass covers the existing run closing in between.
+  for (let pass = 1; pass <= 3; pass++) {
+    const inserted = await client.query(
+      `
+      WITH inserted AS (
+        INSERT INTO ${SCHEMA_NAME}.run (id, workflow_name, workflow_id, input)
+        VALUES (gen_random_uuid(), $1, $2, $3::jsonb)
+        ON CONFLICT (workflow_name, workflow_id) WHERE ${OPEN_STATUSES_SQL}
+        DO NOTHING
+        RETURNING id
+      ), scheduled AS (
+        INSERT INTO ${SCHEMA_NAME}.task (run_id, queue, available_at, priority)
+        SELECT id, $4, COALESCE($5::timestamptz, now()), $6 FROM inserted
+        RETURNING run_id
+      )
+      SELECT id FROM inserted
+      `,
+      values,
+    );
+
+    const row = (inserted.rows as { id: string }[])[0];
+    if (row !== undefined) {
+      return { runId: row.id, created: true };
+    }
+
+    const existing = await client.query(
+      `
+      SELECT id FROM ${SCHEMA_NAME}.run
+       WHERE workflow_name = $1 AND workflow_id = $2 AND ${OPEN_STATUSES_SQL}
+       LIMIT 1
+      `,
+      [options.workflowName, options.workflowId],
+    );
+
+    const open = (existing.rows as { id: string }[])[0];
+    if (open !== undefined) {
+      return { runId: open.id, created: false };
+    }
+  }
+
+  throw new CairnError(
+    `Could not start ${options.workflowName}/${options.workflowId}: an open run kept ` +
+      `appearing and closing. This should be transient — retry.`,
+  );
+}
+
+/**
+ * Take ownership of up to `limit` due tasks.
+ *
+ * `FOR UPDATE SKIP LOCKED` lets any number of workers claim disjoint batches
+ * without blocking each other. A task whose lease has expired is claimable
+ * again, which is what recovers work from a dead worker — recovery is a
+ * property of this query rather than of a reaper process that could itself be
+ * down.
+ *
+ * Every claim increments `fence`. That number is the caller's proof of
+ * ownership for every subsequent write; see {@link heartbeatTask}.
+ */
+export async function claimTasks(
+  client: SqlExecutor,
+  options: ClaimOptions,
+): Promise<ClaimedTask[]> {
+  requireNonEmpty(options.workerId, "workerId");
+
+  const queue = options.queue ?? "default";
+  requireNonEmpty(queue, "queue");
+
+  const limit = options.limit ?? DEFAULT_CLAIM_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new InvalidArgumentError(
+      `limit must be an integer of at least 1, received ${limit}.`,
+    );
+  }
+
+  const result = await client.query(
+    `
+    UPDATE ${SCHEMA_NAME}.task AS t
+       SET lease_owner = $1::uuid,
+           lease_until = now() + make_interval(secs => $2::double precision / 1000),
+           fence = t.fence + 1
+     WHERE t.id IN (
+             SELECT c.id
+               FROM ${SCHEMA_NAME}.task AS c
+              WHERE c.queue = $3
+                AND c.available_at <= now()
+                AND (c.lease_owner IS NULL OR c.lease_until < now())
+              ORDER BY c.priority DESC, c.available_at
+              LIMIT $4
+                FOR UPDATE SKIP LOCKED
+           )
+    RETURNING t.id, t.run_id, t.queue, t.attempt, t.priority, t.fence, t.lease_until
+    `,
+    [options.workerId, leaseMilliseconds(options.leaseFor), queue, limit],
+  );
+
+  return (result.rows as ClaimedTaskRow[]).map((row) => ({
+    taskId: row.id,
+    runId: row.run_id,
+    queue: row.queue,
+    attempt: row.attempt,
+    priority: row.priority,
+    fence: row.fence,
+    leaseUntil: row.lease_until,
+  }));
+}
+
+/**
+ * Extend a lease the caller still owns. Returns `false` if it does not.
+ *
+ * `false` means the fence has moved: the lease expired while this worker was
+ * stalled and someone else claimed the task. The correct response is to stop
+ * touching the run entirely. Note what fencing cannot undo — a stalled worker
+ * may already have performed a side effect, which is exactly why steps are
+ * at-least-once and why idempotency keys exist.
+ */
+export async function heartbeatTask(
+  client: SqlExecutor,
+  lease: TaskLease,
+  leaseFor?: Duration,
+): Promise<boolean> {
+  const result = await client.query(
+    `
+    UPDATE ${SCHEMA_NAME}.task
+       SET lease_until = now() + make_interval(secs => $3::double precision / 1000)
+     WHERE id = $1::bigint AND fence = $2::bigint
+    RETURNING id
+    `,
+    [lease.taskId, lease.fence, leaseMilliseconds(leaseFor)],
+  );
+
+  return result.rows.length === 1;
+}
+
+/**
+ * Give up a lease so the task can be claimed again, optionally later and with a
+ * new attempt count. Returns `false` if the caller no longer owns it.
+ *
+ * This is how both retry backoff and durable sleep are expressed: both are
+ * "make this claimable at a later moment".
+ */
+export async function releaseTask(
+  client: SqlExecutor,
+  lease: TaskLease,
+  options: ReleaseOptions = {},
+): Promise<boolean> {
+  if (
+    options.attempt !== undefined &&
+    (!Number.isInteger(options.attempt) || options.attempt < 0)
+  ) {
+    throw new InvalidArgumentError(
+      `attempt must be a non-negative integer, received ${options.attempt}.`,
+    );
+  }
+
+  const result = await client.query(
+    `
+    UPDATE ${SCHEMA_NAME}.task
+       SET lease_owner  = NULL,
+           lease_until  = NULL,
+           available_at = COALESCE($3::timestamptz, now()),
+           attempt      = COALESCE($4::integer, attempt)
+     WHERE id = $1::bigint AND fence = $2::bigint
+    RETURNING id
+    `,
+    [lease.taskId, lease.fence, options.availableAt ?? null, options.attempt ?? null],
+  );
+
+  return result.rows.length === 1;
+}
+
+/**
+ * Remove a task because its run has reached a terminal state. Returns `false`
+ * if the caller no longer owns it.
+ */
+export async function deleteTask(
+  client: SqlExecutor,
+  lease: TaskLease,
+): Promise<boolean> {
+  const result = await client.query(
+    `
+    DELETE FROM ${SCHEMA_NAME}.task
+     WHERE id = $1::bigint AND fence = $2::bigint
+    RETURNING id
+    `,
+    [lease.taskId, lease.fence],
+  );
+
+  return result.rows.length === 1;
+}
+
+/** Read a run, or `undefined` if there is no such run. */
+export async function getRun(
+  client: SqlExecutor,
+  runId: string,
+): Promise<RunRecord | undefined> {
+  const result = await client.query(
+    `
+    SELECT id, workflow_name, workflow_id, status, input, output, error,
+           stall_reason, journal_len, created_at, closed_at
+      FROM ${SCHEMA_NAME}.run
+     WHERE id = $1::uuid
+    `,
+    [runId],
+  );
+
+  const row = (result.rows as RunRow[])[0];
+  if (row === undefined) {
+    return undefined;
+  }
+
+  return {
+    id: row.id,
+    workflowName: row.workflow_name,
+    workflowId: row.workflow_id,
+    status: row.status,
+    input: row.input,
+    output: row.output,
+    error: row.error,
+    stallReason: row.stall_reason,
+    journalLen: row.journal_len,
+    createdAt: row.created_at,
+    closedAt: row.closed_at,
+  };
+}
+
+interface ClaimedTaskRow {
+  id: string;
+  run_id: string;
+  queue: string;
+  attempt: number;
+  priority: number;
+  fence: string;
+  lease_until: Date;
+}
+
+interface RunRow {
+  id: string;
+  workflow_name: string;
+  workflow_id: string;
+  status: RunStatus;
+  input: unknown;
+  output: unknown;
+  error: unknown;
+  stall_reason: string | null;
+  journal_len: number;
+  created_at: Date;
+  closed_at: Date | null;
+}
+
+function leaseMilliseconds(leaseFor: Duration | undefined): number {
+  const milliseconds = parseDuration(leaseFor ?? DEFAULT_LEASE);
+  if (milliseconds <= 0) {
+    throw new InvalidArgumentError("leaseFor must be greater than zero.");
+  }
+  return milliseconds;
+}
+
+function requireNonEmpty(value: string, name: string): void {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new InvalidArgumentError(`${name} must be a non-empty string.`);
+  }
+}

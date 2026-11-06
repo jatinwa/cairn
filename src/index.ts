@@ -1,5 +1,6 @@
 export {
   CairnError,
+  InvalidArgumentError,
   InvalidDurationError,
   InvalidRetryPolicyError,
   InvalidStepNameError,
@@ -8,15 +9,34 @@ export {
   NonRetryableError,
 } from "./errors.js";
 
+export { OPEN_STATUSES_SQL, SCHEMA_NAME, type SqlExecutor } from "./sql.js";
+
 export {
   checksumOf,
   loadMigrations,
   migrate,
-  SCHEMA_NAME,
   type MigrateResult,
   type Migration,
-  type SqlExecutor,
 } from "./migrate.js";
+
+export {
+  claimTasks,
+  deleteTask,
+  getRun,
+  heartbeatTask,
+  releaseTask,
+  startRun,
+  DEFAULT_CLAIM_LIMIT,
+  DEFAULT_LEASE,
+  type ClaimOptions,
+  type ClaimedTask,
+  type ReleaseOptions,
+  type RunRecord,
+  type RunStatus,
+  type StartRunOptions,
+  type StartRunResult,
+  type TaskLease,
+} from "./store.js";
 
 export { parseDuration, type Duration } from "./duration.js";
 
