@@ -7,7 +7,23 @@ export {
   MigrationChecksumError,
   MigrationError,
   NonRetryableError,
+  serialiseError,
+  type SerialisedError,
 } from "./errors.js";
+
+export {
+  beginStep,
+  completeStep,
+  failStep,
+  readJournal,
+  type BeginStepOptions,
+  type CompleteStepOptions,
+  type FailStepOptions,
+  type Journal,
+  type JournalEntry,
+  type StepCommitOutcome,
+  type StepStatus,
+} from "./journal.js";
 
 export { OPEN_STATUSES_SQL, SCHEMA_NAME, type SqlExecutor } from "./sql.js";
 

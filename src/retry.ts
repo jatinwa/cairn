@@ -1,5 +1,7 @@
 import { parseDuration, type Duration } from "./duration.js";
-import { InvalidRetryPolicyError, NonRetryableError } from "./errors.js";
+import { errorType, InvalidRetryPolicyError, NonRetryableError } from "./errors.js";
+
+export { errorType };
 
 export type JitterMode = "none" | "full";
 
@@ -95,14 +97,6 @@ export function retryDelay(
   const capped = Math.min(uncapped, policy.maxInterval);
 
   return Math.round(policy.jitter === "full" ? random() * capped : capped);
-}
-
-/**
- * The name a retry policy matches an error by. `Error.name` for errors,
- * otherwise the `typeof` of whatever was thrown.
- */
-export function errorType(error: unknown): string {
-  return error instanceof Error ? error.name : typeof error;
 }
 
 /** Whether the policy permits retrying this error at all, ignoring attempt count. */

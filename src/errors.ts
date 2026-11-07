@@ -53,6 +53,36 @@ export class InvalidRetryPolicyError extends CairnError {
   }
 }
 
+/**
+ * The name a retry policy matches an error by, and the `type` recorded in a
+ * journal entry. `Error.name` for errors, otherwise the `typeof` of whatever
+ * was thrown — because `throw "boom"` is legal JavaScript.
+ */
+export function errorType(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+/** An error reduced to something storable in a `jsonb` column. */
+export interface SerialisedError {
+  readonly type: string;
+  readonly message: string;
+  readonly stack?: string;
+}
+
+/**
+ * Reduce a thrown value to a storable shape.
+ *
+ * `JSON.stringify(new Error("boom"))` is `{}` — `message` and `stack` are not
+ * enumerable — so an error written straight to a `jsonb` column loses
+ * everything that made it useful. Hence this.
+ */
+export function serialiseError(error: unknown): SerialisedError {
+  if (error instanceof Error) {
+    return { type: error.name, message: error.message, stack: error.stack };
+  }
+  return { type: typeof error, message: String(error) };
+}
+
 /** An argument to a public function was outside its contract. */
 export class InvalidArgumentError extends CairnError {
   constructor(message: string) {
