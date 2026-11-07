@@ -221,10 +221,16 @@ describe.skipIf(!hasDatabase)("claimTasks", () => {
         availableAt: older,
       });
 
-      const claimed = await claimTasks(client, { workerId: worker(), limit: 3 });
-      const names = await workflowIdsOf(client, claimed);
+      // One per call, deliberately. `UPDATE ... RETURNING` makes no promise
+      // about the order it returns rows in — only about which rows it touched —
+      // so the order the subquery chose is observable only by claiming singly.
+      const order: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const claimed = await claimTasks(client, { workerId: worker(), limit: 1 });
+        order.push(...(await workflowIdsOf(client, claimed)));
+      }
 
-      expect(names).toEqual(["high", "old", "low"]);
+      expect(order).toEqual(["high", "old", "low"]);
     });
   });
 
@@ -339,6 +345,18 @@ describe.skipIf(!hasDatabase)("leases and fencing", () => {
       const again = await claimTasks(client, { workerId: worker() });
       expect(again).toHaveLength(1);
       expect(again[0]!.fence).toBe("2");
+    });
+  });
+
+  // Without the `lease_owner IS NOT NULL` guard in heartbeatTask this raises a
+  // task_lease_paired constraint violation instead of returning false.
+  it("refuses a heartbeat on a task that has already been released", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+      expect(await releaseTask(client, task!)).toBe(true);
+
+      expect(await heartbeatTask(client, task!)).toBe(false);
     });
   });
 

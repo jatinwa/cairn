@@ -99,7 +99,7 @@ Still to come: the worker loop, and the `step()` and `sleep()` functions shown a
 
 ## Development
 
-Requirements: **Node >= 20.11**. Docker is optional — the database tests start a throwaway
+Requirements: **Node >= 22.12**. Docker is optional — the database tests start a throwaway
 Postgres via testcontainers when one is available and skip themselves when it is not. Set
 `DATABASE_URL` to use a server you already have instead.
 
@@ -113,8 +113,8 @@ npm test
 `npm run db:up` and `npm run db:down` start and stop a local Postgres on port 5433, if you
 would rather not rely on testcontainers.
 
-CI runs the whole suite on Node 20, 22 and 24 against Postgres 15, 16 and 17, and fails if
-the database tests skip — a green tick means they actually ran.
+CI runs the whole suite on Node 22 and 24 against Postgres 15, 16 and 17, and fails if the
+database tests skip — a green tick means they actually ran.
 
 ## Licence
 

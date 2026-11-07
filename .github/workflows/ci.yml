@@ -54,11 +54,10 @@ jobs:
       # One combination failing should not hide the others.
       fail-fast: false
       matrix:
-        # Node 20 is the floor from `engines`, 24 the newest; Postgres 15 and 16
+        # Node 22 is the floor from `engines` — Vitest 5 requires
+        # ^22.12 || ^24 || >=26, and Node 20 is end-of-life. Postgres 15 and 16
         # guard against depending on something only 17 provides.
         include:
-          - node: 20
-            postgres: 17
           - node: 22
             postgres: 17
           - node: 24

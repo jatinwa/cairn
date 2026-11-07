@@ -233,11 +233,17 @@ export async function claimTasks(
 /**
  * Extend a lease the caller still owns. Returns `false` if it does not.
  *
- * `false` means the fence has moved: the lease expired while this worker was
- * stalled and someone else claimed the task. The correct response is to stop
- * touching the run entirely. Note what fencing cannot undo — a stalled worker
- * may already have performed a side effect, which is exactly why steps are
- * at-least-once and why idempotency keys exist.
+ * `false` means the caller no longer holds the lease: either the fence has
+ * moved, because the lease expired while this worker was stalled and someone
+ * else claimed the task, or the lease was already given up. The correct
+ * response to either is to stop touching the run entirely. Note what fencing
+ * cannot undo — a stalled worker may already have performed a side effect,
+ * which is exactly why steps are at-least-once and why idempotency keys exist.
+ *
+ * The `lease_owner IS NOT NULL` guard is not redundant. Without it, a heartbeat
+ * on a task that had already been released would set `lease_until` while
+ * `lease_owner` stayed NULL, violating the `task_lease_paired` constraint — so
+ * the caller would get a Postgres error instead of a plain `false`.
  */
 export async function heartbeatTask(
   client: SqlExecutor,
@@ -248,7 +254,7 @@ export async function heartbeatTask(
     `
     UPDATE ${SCHEMA_NAME}.task
        SET lease_until = now() + make_interval(secs => $3::double precision / 1000)
-     WHERE id = $1::bigint AND fence = $2::bigint
+     WHERE id = $1::bigint AND fence = $2::bigint AND lease_owner IS NOT NULL
     RETURNING id
     `,
     [lease.taskId, lease.fence, leaseMilliseconds(leaseFor)],
