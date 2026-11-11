@@ -55,17 +55,21 @@ async function taskRow(client: Client) {
 
 describe("journal argument validation", () => {
   const client = { query: () => Promise.resolve({ rows: [] }) };
-  const lease: TaskLease = { taskId: "1", fence: "1" };
 
   it("rejects an empty step key", async () => {
     await expect(beginStep(client, { runId: randomUUID(), key: "" })).rejects.toThrow(
       InvalidArgumentError,
     );
     await expect(
-      completeStep(client, lease, { runId: randomUUID(), key: "  " }),
+      completeStep(client, { runId: randomUUID(), key: "  " }),
     ).rejects.toThrow(InvalidArgumentError);
     await expect(
-      failStep(client, { runId: randomUUID(), key: "", error: new Error("x"), permanent: true }),
+      failStep(client, {
+        runId: randomUUID(),
+        key: "",
+        error: new Error("x"),
+        permanent: true,
+      }),
     ).rejects.toThrow(InvalidArgumentError);
   });
 });
@@ -82,9 +86,9 @@ describe.skipIf(!hasDatabase)("readJournal", () => {
 
   it("returns completed steps keyed by step key, with parsed output", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY, output: { id: "ch_1" } });
+      await completeStep(client, { runId, key: KEY, output: { id: "ch_1" } });
 
       const journal = await readJournal(client, runId);
       const entry = journal.get(KEY);
@@ -132,9 +136,9 @@ describe.skipIf(!hasDatabase)("beginStep", () => {
 
   it("refuses to re-open a completed step", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY, output: 1 });
+      await completeStep(client, { runId, key: KEY, output: 1 });
 
       expect(await beginStep(client, { runId, key: KEY })).toBeUndefined();
       expect((await stepRow(client))?.attempt).toBe(1);
@@ -159,40 +163,56 @@ describe.skipIf(!hasDatabase)("beginStep", () => {
 });
 
 describe.skipIf(!hasDatabase)("completeStep", () => {
-  it("records the result, counts it, and releases the task", async () => {
+  it("records the result and counts it", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
 
-      expect(await completeStep(client, lease, { runId, key: KEY, output: "ok" })).toBe(
-        "committed",
-      );
+      expect(await completeStep(client, { runId, key: KEY, output: "ok" })).toBe(true);
 
+      expect((await stepRow(client))?.status).toBe("completed");
+      expect((await stepRow(client))?.output).toBe("ok");
       expect((await getRun(client, runId))?.journalLen).toBe(1);
-      expect((await taskRow(client))?.lease_owner).toBeNull();
-      // Released, not deleted: the run's continuation is just another claim.
-      const again = await claimTasks(client, { workerId: randomUUID() });
-      expect(again).toHaveLength(1);
-      expect(again[0]!.fence).toBe("2");
     });
   });
 
-  it("resets the task's attempt counter after a successful step", async () => {
+  // The executor keeps its lease and carries on to the next step, so recording
+  // a result must not disturb task ownership. Releasing here is what design
+  // doc §7.3 originally specified, and the amendment explains why it changed.
+  it("leaves the task completely untouched", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
-      await client.query(`UPDATE ${SCHEMA_NAME}.task SET attempt = 4`);
+      const { runId } = await claimed(client);
+      const before = await taskRow(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY });
+      await completeStep(client, { runId, key: KEY, output: "ok" });
 
-      expect((await taskRow(client))?.attempt).toBe(0);
+      expect(await taskRow(client)).toEqual(before);
+      expect((await taskRow(client))?.lease_owner).not.toBeNull();
+    });
+  });
+
+  // Corollary of taking no lease: a worker that lost ownership still records
+  // what it genuinely did, and whoever owns the run next reads it and skips the
+  // step rather than repeating the side effect.
+  it("records the result even for a worker that has been fenced out", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await claimed(client);
+      await beginStep(client, { runId, key: KEY });
+      await client.query(
+        `UPDATE ${SCHEMA_NAME}.task SET lease_until = now() - interval '1 second'`,
+      );
+      await claimTasks(client, { workerId: randomUUID() });
+
+      expect(await completeStep(client, { runId, key: KEY, output: "ok" })).toBe(true);
+      expect((await stepRow(client))?.output).toBe("ok");
     });
   });
 
   it("stores an undefined result as NULL", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY });
+      await completeStep(client, { runId, key: KEY });
 
       expect((await stepRow(client))?.output).toBeNull();
     });
@@ -200,57 +220,21 @@ describe.skipIf(!hasDatabase)("completeStep", () => {
 
   it("does nothing the second time, and does not double-count", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY, output: 1 });
+      await completeStep(client, { runId, key: KEY, output: 1 });
 
-      expect(await completeStep(client, lease, { runId, key: KEY, output: 2 })).toBe(
-        "noop",
-      );
+      expect(await completeStep(client, { runId, key: KEY, output: 2 })).toBe(false);
       expect((await getRun(client, runId))?.journalLen).toBe(1);
       expect((await stepRow(client))?.output).toBe(1);
     });
   });
 
-  it("reports noop when no step was ever opened", async () => {
+  it("reports false when no step was ever opened", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
 
-      expect(await completeStep(client, lease, { runId, key: KEY })).toBe("noop");
-    });
-  });
-
-  // The record of completed work is never fence-gated — it is the truth about
-  // something that happened. Only the task hand-back is.
-  it("still records the result when the caller has been fenced out", async () => {
-    await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
-      await beginStep(client, { runId, key: KEY });
-      await client.query(
-        `UPDATE ${SCHEMA_NAME}.task SET lease_until = now() - interval '1 second'`,
-      );
-      await claimTasks(client, { workerId: randomUUID() });
-
-      expect(await completeStep(client, lease, { runId, key: KEY, output: "ok" })).toBe(
-        "fenced",
-      );
-
-      expect((await stepRow(client))?.status).toBe("completed");
-      expect((await stepRow(client))?.output).toBe("ok");
-      // The new owner still holds it.
-      expect((await taskRow(client))?.lease_owner).not.toBeNull();
-    });
-  });
-
-  it("will not release a task belonging to a different run", async () => {
-    await withMigratedDatabase(async ({ client }) => {
-      const first = await claimed(client, "cust-1");
-      const second = await claimed(client, "cust-2");
-      await beginStep(client, { runId: first.runId, key: KEY });
-
-      expect(
-        await completeStep(client, second.lease, { runId: first.runId, key: KEY }),
-      ).toBe("fenced");
+      expect(await completeStep(client, { runId, key: KEY })).toBe(false);
     });
   });
 });
@@ -311,12 +295,17 @@ describe.skipIf(!hasDatabase)("failStep", () => {
 
   it("will not overwrite a completed step", async () => {
     await withMigratedDatabase(async ({ client }) => {
-      const { runId, lease } = await claimed(client);
+      const { runId } = await claimed(client);
       await beginStep(client, { runId, key: KEY });
-      await completeStep(client, lease, { runId, key: KEY, output: "ok" });
+      await completeStep(client, { runId, key: KEY, output: "ok" });
 
       expect(
-        await failStep(client, { runId, key: KEY, error: new Error("x"), permanent: true }),
+        await failStep(client, {
+          runId,
+          key: KEY,
+          error: new Error("x"),
+          permanent: true,
+        }),
       ).toBe(false);
       expect((await stepRow(client))?.status).toBe("completed");
     });
@@ -327,7 +316,12 @@ describe.skipIf(!hasDatabase)("failStep", () => {
       const { runId } = await claimed(client);
 
       expect(
-        await failStep(client, { runId, key: KEY, error: new Error("x"), permanent: false }),
+        await failStep(client, {
+          runId,
+          key: KEY,
+          error: new Error("x"),
+          permanent: false,
+        }),
       ).toBe(false);
     });
   });

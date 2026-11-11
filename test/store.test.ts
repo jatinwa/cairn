@@ -7,9 +7,11 @@ import { InvalidArgumentError } from "../src/errors.js";
 import { SCHEMA_NAME } from "../src/sql.js";
 import {
   claimTasks,
+  closeRun,
   deleteTask,
   getRun,
   heartbeatTask,
+  markRunRunning,
   releaseTask,
   startRun,
   type ClaimedTask,
@@ -405,6 +407,153 @@ describe.skipIf(!hasDatabase)("getRun", () => {
   it("returns undefined for an unknown run", async () => {
     await withMigratedDatabase(async ({ client }) => {
       expect(await getRun(client, randomUUID())).toBeUndefined();
+    });
+  });
+});
+
+describe.skipIf(!hasDatabase)("markRunRunning", () => {
+  it("moves a claimed run from pending to running", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+
+      expect(await markRunRunning(client, task!)).toBe(true);
+      expect((await getRun(client, runId))?.status).toBe("running");
+    });
+  });
+
+  it("is a no-op the second time", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+      await markRunRunning(client, task!);
+
+      expect(await markRunRunning(client, task!)).toBe(false);
+    });
+  });
+
+  it("refuses a worker that has been fenced out", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [stale] = await claimTasks(client, { workerId: worker() });
+      await expireLease(client);
+      await claimTasks(client, { workerId: worker() });
+
+      expect(await markRunRunning(client, stale!)).toBe(false);
+      expect((await getRun(client, runId))?.status).toBe("pending");
+    });
+  });
+});
+
+describe.skipIf(!hasDatabase)("closeRun", () => {
+  it("closes a run as completed, keeps the output, and removes the task", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+
+      expect(
+        await closeRun(client, task!, {
+          runId,
+          status: "completed",
+          output: { accountId: "acct_1" },
+        }),
+      ).toBe(true);
+
+      const run = await getRun(client, runId);
+      expect(run?.status).toBe("completed");
+      expect(run?.output).toEqual({ accountId: "acct_1" });
+      expect(run?.closedAt).toBeInstanceOf(Date);
+      expect(await countTasks(client)).toBe(0);
+    });
+  });
+
+  it("closes a run as failed, serialising the error", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+
+      await closeRun(client, task!, {
+        runId,
+        status: "failed",
+        error: new TypeError("card declined"),
+      });
+
+      const run = await getRun(client, runId);
+      expect(run?.status).toBe("failed");
+      expect(run?.error).toMatchObject({
+        type: "TypeError",
+        message: "card declined",
+      });
+    });
+  });
+
+  // Deciding a run's fate is an ownership transition, so unlike recording a
+  // step it is fence-gated in full.
+  it("refuses a worker that has been fenced out, leaving the run open", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [stale] = await claimTasks(client, { workerId: worker() });
+      await expireLease(client);
+      await claimTasks(client, { workerId: worker() });
+
+      expect(
+        await closeRun(client, stale!, { runId, status: "completed" }),
+      ).toBe(false);
+
+      const run = await getRun(client, runId);
+      expect(run?.closedAt).toBeNull();
+      expect(await countTasks(client)).toBe(1);
+    });
+  });
+
+  it("refuses a lease that belongs to a different run", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const first = await startRun(client, { workflowName: "w", workflowId: "a" });
+      await startRun(client, { workflowName: "w", workflowId: "b" });
+      const claimedTasks = await claimTasks(client, { workerId: worker(), limit: 2 });
+      const other = claimedTasks.find((task) => task.runId !== first.runId)!;
+
+      expect(
+        await closeRun(client, other, { runId: first.runId, status: "completed" }),
+      ).toBe(false);
+      expect((await getRun(client, first.runId))?.closedAt).toBeNull();
+    });
+  });
+
+  it("will not close a run twice", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+      await closeRun(client, task!, { runId, status: "completed" });
+
+      expect(await closeRun(client, task!, { runId, status: "failed" })).toBe(false);
+      expect((await getRun(client, runId))?.status).toBe("completed");
+    });
+  });
+
+  it("frees the workflow id for a new run", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const first = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+      await closeRun(client, task!, { runId: first.runId, status: "completed" });
+
+      const second = await startRun(client, { workflowName: "w", workflowId: "a" });
+      expect(second.created).toBe(true);
+      expect(second.runId).not.toBe(first.runId);
+    });
+  });
+
+  it("rejects a status that is not a closed one", async () => {
+    await withMigratedDatabase(async ({ client }) => {
+      const { runId } = await startRun(client, { workflowName: "w", workflowId: "a" });
+      const [task] = await claimTasks(client, { workerId: worker() });
+
+      await expect(
+        closeRun(client, task!, {
+          runId,
+          status: "running" as unknown as "completed",
+        }),
+      ).rejects.toThrow(InvalidArgumentError);
     });
   });
 });

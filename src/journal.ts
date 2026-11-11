@@ -1,6 +1,5 @@
 import { InvalidArgumentError, serialiseError } from "./errors.js";
 import { SCHEMA_NAME, type SqlExecutor } from "./sql.js";
-import type { TaskLease } from "./store.js";
 
 export type StepStatus = "running" | "completed" | "failed";
 
@@ -17,20 +16,6 @@ export interface JournalEntry {
 
 /** A run's recorded steps, keyed by step key (`"charge-card#0"`). */
 export type Journal = ReadonlyMap<string, JournalEntry>;
-
-/**
- * The result of committing a step.
- *
- * - `committed` — recorded, and the task released for immediate re-claim.
- * - `fenced` — recorded, but the task was not released because the caller no
- *   longer owns it. The record still stands: it is the truth about work that
- *   genuinely happened, and the worker that now owns the run will read it from
- *   the journal and skip re-running the step. Only ownership transitions are
- *   fence-gated, never the record of completed work.
- * - `noop` — nothing to record. The step was already completed, or no such step
- *   row exists because {@link beginStep} was never called.
- */
-export type StepCommitOutcome = "committed" | "fenced" | "noop";
 
 export interface BeginStepOptions {
   readonly runId: string;
@@ -135,25 +120,25 @@ export async function beginStep(
 }
 
 /**
- * Record a step's result and hand the task back, as one statement.
+ * Record a step's result. Returns `false` if there was nothing to record — the
+ * step was already completed, or {@link beginStep} was never called.
  *
- * This is the step commit from design doc §7.3. Recording the result, counting
- * it, and releasing the task are a single statement precisely because a crash
- * between any two of them is the failure this whole library exists to survive:
- * a result recorded but never counted, or a task never released, would stall
- * the run.
+ * Recording the result and counting it are one statement, so no crash can leave
+ * a result that is recorded but uncounted.
  *
- * The task is released rather than kept, so the run's own continuation is just
- * another claimable task and there is no in-memory state left to lose.
+ * **Takes no lease, and does not touch the task.** The record of completed work
+ * is the truth about something that genuinely happened, so it is never
+ * fence-gated; only ownership transitions are, and those belong to the caller.
+ * An earlier version released the task here, which is the step commit design
+ * doc §7.3 originally described — see that section for why it no longer does.
  *
  * `journal_len` counts **completed** steps. A failed step ends the run, so it
  * never contributes to the journal length that §5.3 caps.
  */
 export async function completeStep(
   client: SqlExecutor,
-  lease: TaskLease,
   options: CompleteStepOptions,
-): Promise<StepCommitOutcome> {
+): Promise<boolean> {
   requireKey(options.key);
 
   const result = await client.query(
@@ -161,45 +146,26 @@ export async function completeStep(
     WITH recorded AS (
       UPDATE ${SCHEMA_NAME}.step
          SET status       = 'completed',
-             output       = $4::jsonb,
+             output       = $3::jsonb,
              output_ref   = NULL,
              error        = NULL,
              completed_at = now()
-       WHERE run_id = $3::uuid AND key = $5 AND status <> 'completed'
+       WHERE run_id = $1::uuid AND key = $2 AND status <> 'completed'
       RETURNING run_id
-    ), counted AS (
-      UPDATE ${SCHEMA_NAME}.run
-         SET journal_len = journal_len + 1
-       WHERE id = (SELECT run_id FROM recorded)
-      RETURNING id
-    ), released AS (
-      UPDATE ${SCHEMA_NAME}.task
-         SET lease_owner  = NULL,
-             lease_until  = NULL,
-             available_at = now(),
-             attempt      = 0
-       WHERE id = $1::bigint
-         AND fence = $2::bigint
-         AND run_id = (SELECT run_id FROM recorded)
-      RETURNING id
     )
-    SELECT (SELECT count(*)::int FROM counted)  AS recorded,
-           (SELECT count(*)::int FROM released) AS released
+    UPDATE ${SCHEMA_NAME}.run
+       SET journal_len = journal_len + 1
+     WHERE id = (SELECT run_id FROM recorded)
+    RETURNING id
     `,
     [
-      lease.taskId,
-      lease.fence,
       options.runId,
-      options.output === undefined ? null : JSON.stringify(options.output),
       options.key,
+      options.output === undefined ? null : JSON.stringify(options.output),
     ],
   );
 
-  const row = (result.rows as { recorded: number; released: number }[])[0];
-  if (row === undefined || row.recorded === 0) {
-    return "noop";
-  }
-  return row.released === 1 ? "committed" : "fenced";
+  return result.rows.length === 1;
 }
 
 /**

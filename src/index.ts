@@ -21,7 +21,6 @@ export {
   type FailStepOptions,
   type Journal,
   type JournalEntry,
-  type StepCommitOutcome,
   type StepStatus,
 } from "./journal.js";
 
@@ -37,15 +36,19 @@ export {
 
 export {
   claimTasks,
+  closeRun,
   deleteTask,
   getRun,
   heartbeatTask,
+  markRunRunning,
   releaseTask,
   startRun,
   DEFAULT_CLAIM_LIMIT,
   DEFAULT_LEASE,
   type ClaimOptions,
   type ClaimedTask,
+  type CloseRunOptions,
+  type ClosedRunStatus,
   type ReleaseOptions,
   type RunRecord,
   type RunStatus,

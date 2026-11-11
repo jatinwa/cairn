@@ -1,5 +1,5 @@
 import { parseDuration, type Duration } from "./duration.js";
-import { CairnError, InvalidArgumentError } from "./errors.js";
+import { CairnError, InvalidArgumentError, serialiseError } from "./errors.js";
 import { OPEN_STATUSES_SQL, SCHEMA_NAME, type SqlExecutor } from "./sql.js";
 
 export type RunStatus =
@@ -10,6 +10,25 @@ export type RunStatus =
   | "failed"
   | "cancelled"
   | "continued";
+
+/** The statuses a run can be closed into. */
+export type ClosedRunStatus = "completed" | "failed" | "cancelled" | "continued";
+
+const CLOSED_STATUSES: ReadonlySet<string> = new Set<ClosedRunStatus>([
+  "completed",
+  "failed",
+  "cancelled",
+  "continued",
+]);
+
+export interface CloseRunOptions {
+  readonly runId: string;
+  readonly status: ClosedRunStatus;
+  /** The run's result, for a `completed` close. */
+  readonly output?: unknown;
+  /** The failure, for a `failed` close. Serialised with `serialiseError`. */
+  readonly error?: unknown;
+}
 
 /** How long a claim holds a task before another worker may take it. */
 export const DEFAULT_LEASE: Duration = "30s";
@@ -318,6 +337,90 @@ export async function deleteTask(
   );
 
   return result.rows.length === 1;
+}
+
+/**
+ * Move a claimed run out of `pending` or `sleeping` into `running`, so its
+ * status reflects what is actually happening to it. Returns `false` if the
+ * caller does not own the task, or the run was already running.
+ */
+export async function markRunRunning(
+  client: SqlExecutor,
+  lease: TaskLease,
+): Promise<boolean> {
+  const result = await client.query(
+    `
+    UPDATE ${SCHEMA_NAME}.run
+       SET status = 'running'
+     WHERE id = (
+             SELECT run_id FROM ${SCHEMA_NAME}.task
+              WHERE id = $1::bigint AND fence = $2::bigint
+           )
+       AND status IN ('pending', 'sleeping')
+    RETURNING id
+    `,
+    [lease.taskId, lease.fence],
+  );
+
+  return result.rows.length === 1;
+}
+
+/**
+ * Close a run and remove its task, as one statement. Returns `false` if the
+ * caller no longer owns the task, the lease belongs to a different run, or the
+ * run was already closed.
+ *
+ * Unlike recording a step, deciding a run's outcome **is** an ownership
+ * transition, so this is fence-gated end to end: a worker that lost its lease
+ * does not get to declare the run finished. Closing the run and deleting the
+ * task are one statement because a closed run with a live task would be claimed
+ * forever, and an open run with no task would never progress again.
+ */
+export async function closeRun(
+  client: SqlExecutor,
+  lease: TaskLease,
+  options: CloseRunOptions,
+): Promise<boolean> {
+  if (!CLOSED_STATUSES.has(options.status)) {
+    throw new InvalidArgumentError(
+      `status must be one of ${[...CLOSED_STATUSES].join(", ")}, received ${options.status}.`,
+    );
+  }
+
+  const result = await client.query(
+    `
+    WITH owned AS (
+      SELECT run_id FROM ${SCHEMA_NAME}.task
+       WHERE id = $1::bigint AND fence = $2::bigint AND run_id = $3::uuid
+    ), closed AS (
+      UPDATE ${SCHEMA_NAME}.run
+         SET status    = $4::${SCHEMA_NAME}.run_status,
+             closed_at = now(),
+             output    = $5::jsonb,
+             error     = $6::jsonb
+       WHERE id = (SELECT run_id FROM owned) AND closed_at IS NULL
+      RETURNING id
+    ), removed AS (
+      DELETE FROM ${SCHEMA_NAME}.task
+       WHERE id = $1::bigint
+         AND fence = $2::bigint
+         AND EXISTS (SELECT 1 FROM closed)
+      RETURNING id
+    )
+    SELECT (SELECT count(*)::int FROM removed) AS removed
+    `,
+    [
+      lease.taskId,
+      lease.fence,
+      options.runId,
+      options.status,
+      options.output === undefined ? null : JSON.stringify(options.output),
+      options.error === undefined ? null : JSON.stringify(serialiseError(options.error)),
+    ],
+  );
+
+  const row = (result.rows as { removed: number }[])[0];
+  return row?.removed === 1;
 }
 
 /** Read a run, or `undefined` if there is no such run. */
