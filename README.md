@@ -4,9 +4,10 @@ Durable execution for applications that already have Postgres.
 
 [![CI](https://github.com/jatinwa/cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/jatinwa/cairn/actions/workflows/ci.yml)
 
-> **Status: pre-alpha. Nothing works yet.**
-> There is no runtime, no published package, and no API stability. The name is a placeholder
-> pending an npm and trademark check.
+> **Status: pre-alpha.**
+> Workflows run, and survive a crash at any point — but there is no worker loop yet, so you
+> drive the executor yourself. No published package and no API stability. The name is a
+> placeholder pending an npm and trademark check.
 
 ---
 
@@ -23,7 +24,8 @@ there is no cluster, broker or control plane to operate.
 It is not a job queue. If you want high-throughput fire-and-forget work, use one; `cairn`
 optimises for the correctness of *sequences*.
 
-The target API, for reference — **this does not run today**:
+This runs today. What is missing is the loop around it: something has to claim tasks and call
+the executor, and for now that is you.
 
 ```ts
 import { defineWorkflow, step, sleep } from "cairn";
@@ -72,8 +74,6 @@ does not silently retry forever.
 
 ## What's implemented
 
-The foundations. There is no worker loop yet, so nothing runs a workflow:
-
 | Module | Provides |
 |---|---|
 | `duration.ts` | `parseDuration("14 days")` → milliseconds, for timers and retry policies |
@@ -81,6 +81,10 @@ The foundations. There is no worker loop yet, so nothing runs a workflow:
 | `retry.ts` | Retry policy resolution, and `retryDelay()` with full jitter on by default |
 | `errors.ts` | `NonRetryableError`, plus the library's own error types |
 | `migrate.ts` | Applies the SQL schema — idempotent, and safe from several processes at once |
+| `store.ts` | Starting runs, claiming tasks, leases and fences, closing and parking runs |
+| `journal.ts` | The record of completed steps — read in one query, written once each |
+| `workflow.ts` | `defineWorkflow`, and the `step()` and `sleep()` primitives |
+| `execute.ts` | `executeTask`, which runs one claimed task to its next suspension point |
 
 The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
 collide with your own `run`, `step` or `task` tables. Migrating takes any client with a
@@ -95,7 +99,8 @@ await client.connect();
 await migrate(client); // safe to call on every boot
 ```
 
-Still to come: the worker loop, and the `step()` and `sleep()` functions shown above.
+Still to come: the worker loop that polls and heartbeats for you, OpenTelemetry spans, and
+the retention sweep.
 
 ## Development
 

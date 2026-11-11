@@ -1,5 +1,19 @@
+export { executeTask, type ExecuteDeps, type ExecutionOutcome } from "./execute.js";
+
+export {
+  defineWorkflow,
+  sleep,
+  step,
+  type RegisteredWorkflow,
+  type StepOptions,
+  type WorkflowContext,
+  type WorkflowDefinition,
+  type WorkflowFunction,
+} from "./workflow.js";
+
 export {
   CairnError,
+  EngineError,
   InvalidArgumentError,
   InvalidDurationError,
   InvalidRetryPolicyError,
@@ -41,6 +55,7 @@ export {
   getRun,
   heartbeatTask,
   markRunRunning,
+  parkRun,
   releaseTask,
   startRun,
   DEFAULT_CLAIM_LIMIT,

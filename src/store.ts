@@ -423,6 +423,56 @@ export async function closeRun(
   return row?.removed === 1;
 }
 
+/**
+ * Stop a run from being claimed again, recording why. Returns `false` if the
+ * caller no longer owns the task.
+ *
+ * `available_at` is set to `'infinity'`, so the task still exists and is still
+ * inspectable but can never be claimed. Un-parking is then just setting a real
+ * timestamp back.
+ *
+ * This is the answer to the failure mode research §5 found in Temporal, where a
+ * workflow that cannot progress retries with backoff forever against an
+ * infinite default timeout — it stops working but never fails, and nothing
+ * says so. A parked run has a `stall_reason` and shows up in
+ * `cairn_run_stalled_total`.
+ */
+export async function parkRun(
+  client: SqlExecutor,
+  lease: TaskLease,
+  reason: string,
+): Promise<boolean> {
+  requireNonEmpty(reason, "reason");
+
+  const result = await client.query(
+    `
+    WITH owned AS (
+      SELECT run_id FROM ${SCHEMA_NAME}.task
+       WHERE id = $1::bigint AND fence = $2::bigint
+    ), marked AS (
+      UPDATE ${SCHEMA_NAME}.run
+         SET stall_reason = $3
+       WHERE id = (SELECT run_id FROM owned)
+      RETURNING id
+    ), parked AS (
+      UPDATE ${SCHEMA_NAME}.task
+         SET lease_owner  = NULL,
+             lease_until  = NULL,
+             available_at = 'infinity'
+       WHERE id = $1::bigint
+         AND fence = $2::bigint
+         AND EXISTS (SELECT 1 FROM marked)
+      RETURNING id
+    )
+    SELECT (SELECT count(*)::int FROM parked) AS parked
+    `,
+    [lease.taskId, lease.fence, reason],
+  );
+
+  const row = (result.rows as { parked: number }[])[0];
+  return row?.parked === 1;
+}
+
 /** Read a run, or `undefined` if there is no such run. */
 export async function getRun(
   client: SqlExecutor,

@@ -83,6 +83,21 @@ export function serialiseError(error: unknown): SerialisedError {
   return { type: typeof error, message: String(error) };
 }
 
+/**
+ * The engine's own bookkeeping failed — a journal write, a status update.
+ *
+ * Kept distinct from an error thrown by a workflow because the right responses
+ * are opposite. A workflow that throws has failed, and its run should close. A
+ * database that is unreachable has told us nothing about the workflow, so the
+ * attempt must be abandoned and left for another worker once the lease expires.
+ */
+export class EngineError extends CairnError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "EngineError";
+  }
+}
+
 /** An argument to a public function was outside its contract. */
 export class InvalidArgumentError extends CairnError {
   constructor(message: string) {
