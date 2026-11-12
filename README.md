@@ -5,9 +5,9 @@ Durable execution for applications that already have Postgres.
 [![CI](https://github.com/jatinwa/cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/jatinwa/cairn/actions/workflows/ci.yml)
 
 > **Status: pre-alpha.**
-> Workflows run, and survive a crash at any point — but there is no worker loop yet, so you
-> drive the executor yourself. No published package and no API stability. The name is a
-> placeholder pending an npm and trademark check.
+> Workflows run, survive a crash at any point, and a worker polls for them. No published
+> package and no API stability, and plenty from the design is still missing — cancellation,
+> tracing, retention. The name is a placeholder pending an npm and trademark check.
 
 ---
 
@@ -24,8 +24,7 @@ there is no cluster, broker or control plane to operate.
 It is not a job queue. If you want high-throughput fire-and-forget work, use one; `cairn`
 optimises for the correctness of *sequences*.
 
-This runs today. What is missing is the loop around it: something has to claim tasks and call
-the executor, and for now that is you.
+This runs today.
 
 ```ts
 import { defineWorkflow, step, sleep } from "cairn";
@@ -54,6 +53,29 @@ export const onboard = defineWorkflow("onboard", async (ctx, input) => {
 
 Ordinary control flow. No sandbox, no forbidden APIs, no bundler step. `sleep("14 days")`
 survives process death, deploys, and the fortnight in between.
+
+To run it, start a worker and submit a job:
+
+```ts
+import { createWorker, startRun } from "cairn";
+
+const worker = createWorker({ client, workflows: [onboard], concurrency: 4 });
+worker.start();
+
+await startRun(client, {
+  workflowName: "onboard",
+  workflowId: `signup:${user.id}`, // one open run per key, so a double click is one job
+  input: { amount: 1999, userId: user.id, email: user.email },
+});
+```
+
+A step may take far longer than the lease: the worker heartbeats it while it runs, because a
+lease is there to notice a worker that **died**, not one that is slow. On shutdown,
+`worker.stop()` stops claiming and waits for work in flight.
+
+Give the worker a connection **pool**, not a single client. Heartbeats overlap the queries of
+the task they are keeping alive, so a worker always has more than one query in flight even at
+`concurrency: 1`.
 
 ## What it guarantees, stated plainly
 
@@ -85,6 +107,7 @@ does not silently retry forever.
 | `journal.ts` | The record of completed steps — read in one query, written once each |
 | `workflow.ts` | `defineWorkflow`, and the `step()` and `sleep()` primitives |
 | `execute.ts` | `executeTask`, which runs one claimed task to its next suspension point |
+| `worker.ts` | `createWorker` — polling, heartbeating, concurrency, graceful shutdown |
 
 The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
 collide with your own `run`, `step` or `task` tables. Migrating takes any client with a
@@ -99,8 +122,8 @@ await client.connect();
 await migrate(client); // safe to call on every boot
 ```
 
-Still to come: the worker loop that polls and heartbeats for you, OpenTelemetry spans, and
-the retention sweep.
+Still to come: cancellation, OpenTelemetry spans, continue-as-new for long journals, payload
+offloading and the retention sweep, and a CLI.
 
 ## Development
 

@@ -1,6 +1,15 @@
 export { executeTask, type ExecuteDeps, type ExecutionOutcome } from "./execute.js";
 
 export {
+  createWorker,
+  waitForRun,
+  type StopOptions,
+  type Worker,
+  type WorkerEvent,
+  type WorkerOptions,
+} from "./worker.js";
+
+export {
   defineWorkflow,
   sleep,
   step,
