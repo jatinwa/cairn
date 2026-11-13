@@ -301,7 +301,10 @@ describe.skipIf(!hasDatabase)("leases and fencing", () => {
       await startRun(client, { workflowName: "w", workflowId: "a" });
       const [task] = await claimTasks(client, { workerId: worker(), leaseFor: "1s" });
 
-      expect(await heartbeatTask(client, task!, "1m")).toBe(true);
+      expect(await heartbeatTask(client, task!, "1m")).toEqual({
+        held: true,
+        cancelRequested: false,
+      });
 
       const { rows } = await client.query<{ lease_until: Date }>(
         `SELECT lease_until FROM ${SCHEMA_NAME}.task`,
@@ -319,7 +322,7 @@ describe.skipIf(!hasDatabase)("leases and fencing", () => {
       await expireLease(client);
       await claimTasks(client, { workerId: worker() });
 
-      expect(await heartbeatTask(client, stale!)).toBe(false);
+      expect((await heartbeatTask(client, stale!)).held).toBe(false);
     });
   });
 
@@ -358,7 +361,7 @@ describe.skipIf(!hasDatabase)("leases and fencing", () => {
       const [task] = await claimTasks(client, { workerId: worker() });
       expect(await releaseTask(client, task!)).toBe(true);
 
-      expect(await heartbeatTask(client, task!)).toBe(false);
+      expect((await heartbeatTask(client, task!)).held).toBe(false);
     });
   });
 

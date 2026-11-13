@@ -24,6 +24,12 @@ export interface WorkflowContext {
    * whose name it names.
    */
   idempotencyKey(name: string): string;
+  /**
+   * Aborts when the run has been asked to stop. Pass it to anything that
+   * accepts one — `fetch`, a database driver — so a cancelled run stops at the
+   * work it is doing rather than only between steps.
+   */
+  readonly signal: AbortSignal;
 }
 
 export type WorkflowFunction<Input = unknown, Output = unknown> = (
@@ -77,7 +83,9 @@ export type Suspension =
       readonly key: string;
       readonly attempt: number;
     }
-  | { readonly kind: "fenced"; readonly key: string };
+  | { readonly kind: "fenced"; readonly key: string }
+  /** The run was asked to stop, and execution has unwound to a safe point. */
+  | { readonly kind: "cancelled"; readonly key: string };
 
 export interface ExecutionState {
   readonly runId: string;
@@ -88,6 +96,8 @@ export interface ExecutionState {
   readonly occurrences: Map<string, number>;
   /** The occurrence currently executing per name, for `idempotencyKey`. */
   readonly inFlight: Map<string, number>;
+  /** Aborted when this run has been asked to stop. */
+  readonly signal: AbortSignal;
   suspend(suspension: Suspension): void;
   /**
    * Set when the engine's own bookkeeping failed. Recorded here rather than
@@ -170,6 +180,14 @@ export async function step<T>(
   if (recorded?.status === "completed") {
     return recorded.output as T;
   }
+
+  // Checked at the boundary as well as inside the step, so cancellation still
+  // works for a step function that ignores the signal — it just takes effect
+  // after that step rather than during it.
+  if (state.signal.aborted) {
+    state.suspend({ kind: "cancelled", key });
+    return never<T>();
+  }
   if (recorded?.status === "failed") {
     throw new CairnError(
       `Step ${key} failed permanently on an earlier attempt: ${describe(recorded.error)}`,
@@ -195,6 +213,16 @@ export async function step<T>(
   try {
     output = await fn();
   } catch (error) {
+    // A step that threw because it was aborted has not failed on its merits,
+    // so it is not marked failed and not retried. The run is stopping.
+    if (state.signal.aborted) {
+      await engine(state, `record the interruption of ${key}`, () =>
+        failStep(state.client, { runId: state.runId, key, error, permanent: false }),
+      );
+      state.suspend({ kind: "cancelled", key });
+      return never<T>();
+    }
+
     if (shouldRetry(error, policy, attempt)) {
       await engine(state, `record a retryable failure of ${key}`, () =>
         failStep(state.client, { runId: state.runId, key, error, permanent: false }),
@@ -235,6 +263,11 @@ export async function sleep(name: string, duration: Duration): Promise<void> {
     return;
   }
 
+  if (state.signal.aborted) {
+    state.suspend({ kind: "cancelled", key });
+    return never<void>();
+  }
+
   const until = new Date(Date.now() + parseDuration(duration));
   const attempt = await engine(state, `open sleep ${key}`, () =>
     beginStep(state.client, { runId: state.runId, key }),
@@ -265,6 +298,7 @@ export function makeContext(
     runId,
     workflowId,
     attempt,
+    signal: state.signal,
     idempotencyKey: (name) =>
       idempotencyKey(runId, name, state.inFlight.get(name) ?? 0),
   };

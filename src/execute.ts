@@ -48,7 +48,18 @@ export type ExecutionOutcome =
    */
   | { readonly kind: "abandoned"; readonly error: unknown }
   /** No worker here knows this workflow. The run is parked with a reason. */
-  | { readonly kind: "unroutable"; readonly workflowName: string };
+  | { readonly kind: "unroutable"; readonly workflowName: string }
+  /** The run was asked to stop, unwound, and is closed as cancelled. */
+  | { readonly kind: "cancelled" };
+
+export interface ExecuteOptions {
+  /**
+   * Aborts the run's steps. The worker wires this to what its heartbeat learns
+   * about cancellation; the executor also aborts it on its own if the run was
+   * already marked for cancellation before this attempt started.
+   */
+  readonly signal?: AbortSignal;
+}
 
 /**
  * Run one claimed task as far as it will go.
@@ -65,6 +76,7 @@ export type ExecutionOutcome =
 export async function executeTask(
   deps: ExecuteDeps,
   task: ClaimedTask,
+  options: ExecuteOptions = {},
 ): Promise<ExecutionOutcome> {
   const { client, workflows } = deps;
 
@@ -82,6 +94,19 @@ export async function executeTask(
 
   await markRunRunning(client, task);
 
+  // One controller for this attempt, fed by the caller's signal and by what the
+  // run itself already says. Checking the run here means a cancellation that
+  // arrived while the task sat in the queue is honoured immediately, rather
+  // than waiting for the first heartbeat.
+  const controller = new AbortController();
+  const abort = () => {
+    controller.abort();
+  };
+  if (options.signal?.aborted === true || run.cancelRequestedAt !== null) {
+    abort();
+  }
+  options.signal?.addEventListener("abort", abort, { once: true });
+
   let suspension: Suspension | undefined;
   let signalSuspended!: () => void;
   const suspended = new Promise<{ kind: "suspended" }>((resolve) => {
@@ -97,6 +122,7 @@ export async function executeTask(
     policy: resolveRetryPolicy(definition.retry),
     occurrences: new Map(),
     inFlight: new Map(),
+    signal: controller.signal,
     suspend: (next) => {
       if (suspension === undefined) {
         suspension = next;
@@ -133,6 +159,13 @@ export async function executeTask(
     return handleSuspension(deps, task, suspension!);
   }
 
+  // A workflow that threw while the run was being cancelled did not fail on its
+  // merits; it was interrupted. Recording that as a failure would misreport why
+  // the run ended.
+  if (settled.kind === "threw" && controller.signal.aborted) {
+    return closeCancelled(deps, task);
+  }
+
   if (settled.kind === "returned") {
     const closed = await closeRun(client, task, {
       runId: task.runId,
@@ -150,6 +183,17 @@ export async function executeTask(
   return closed ? { kind: "failed", error: settled.error } : { kind: "fenced" };
 }
 
+async function closeCancelled(
+  deps: ExecuteDeps,
+  task: ClaimedTask,
+): Promise<ExecutionOutcome> {
+  const closed = await closeRun(deps.client, task, {
+    runId: task.runId,
+    status: "cancelled",
+  });
+  return closed ? { kind: "cancelled" } : { kind: "fenced" };
+}
+
 async function handleSuspension(
   deps: ExecuteDeps,
   task: ClaimedTask,
@@ -157,6 +201,10 @@ async function handleSuspension(
 ): Promise<ExecutionOutcome> {
   if (suspension.kind === "fenced") {
     return { kind: "fenced" };
+  }
+
+  if (suspension.kind === "cancelled") {
+    return closeCancelled(deps, task);
   }
 
   if (suspension.kind === "sleep") {

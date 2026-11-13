@@ -27,6 +27,8 @@ export type WorkerEvent =
   | { readonly type: "crashed"; readonly task: ClaimedTask; readonly error: unknown }
   /** A heartbeat was refused: this worker no longer owns the task. */
   | { readonly type: "lease-lost"; readonly task: ClaimedTask }
+  /** Somebody asked this run to stop; its steps have been signalled. */
+  | { readonly type: "cancel-requested"; readonly task: ClaimedTask }
   /** The poll loop threw, usually because the database is unreachable. */
   | { readonly type: "poll-failed"; readonly error: unknown }
   | { readonly type: "stopped" };
@@ -130,13 +132,22 @@ export function createWorker(options: WorkerOptions): Worker {
   async function run(task: ClaimedTask): Promise<void> {
     inFlight.add(task.taskId);
 
+    // The heartbeat is also how a running task learns it has been cancelled,
+    // since it is the one thing a worker does regularly while a step runs.
+    const cancellation = new AbortController();
+
     // A third of the lease: two heartbeats may be lost before anyone else can
     // claim the task.
     const beat = setInterval(() => {
       void heartbeatTask(deps.client, task, deps.leaseFor)
-        .then((held) => {
-          if (!held) {
+        .then((result) => {
+          if (!result.held) {
             emit({ type: "lease-lost", task });
+            return;
+          }
+          if (result.cancelRequested && !cancellation.signal.aborted) {
+            emit({ type: "cancel-requested", task });
+            cancellation.abort();
           }
         })
         .catch(() => {
@@ -146,7 +157,7 @@ export function createWorker(options: WorkerOptions): Worker {
     }, Math.max(50, Math.floor(leaseMs / 3)));
 
     try {
-      const outcome = await executeTask(deps, task);
+      const outcome = await executeTask(deps, task, { signal: cancellation.signal });
       emit({ type: "finished", task, outcome });
     } catch (error) {
       // Nothing is known about how far the run got, so the task is left alone

@@ -89,6 +89,24 @@ export interface RunRecord {
   readonly journalLen: number;
   readonly createdAt: Date;
   readonly closedAt: Date | null;
+  /** Set once somebody has asked for this run to stop. */
+  readonly cancelRequestedAt: Date | null;
+  readonly cancelReason: string | null;
+}
+
+export type CancelResult =
+  /** Nobody was working on it, so it is already closed as cancelled. */
+  | "cancelled"
+  /** A worker holds it; the request is recorded and it will unwind. */
+  | "requested"
+  | "already-closed"
+  | "not-found";
+
+export interface HeartbeatResult {
+  /** `false` when the caller no longer holds the lease. */
+  readonly held: boolean;
+  /** `true` when somebody has asked for this run to stop. */
+  readonly cancelRequested: boolean;
 }
 
 export interface ClaimOptions {
@@ -262,24 +280,101 @@ export async function claimTasks(
  * The `lease_owner IS NOT NULL` guard is not redundant. Without it, a heartbeat
  * on a task that had already been released would set `lease_until` while
  * `lease_owner` stayed NULL, violating the `task_lease_paired` constraint — so
- * the caller would get a Postgres error instead of a plain `false`.
+ * the caller would get a Postgres error instead of a plain `held: false`.
+ *
+ * The same statement reports whether the run has been asked to stop. The
+ * heartbeat is already the one thing a worker does regularly while a step
+ * runs, so cancellation rides along with it rather than costing a query of its
+ * own.
  */
 export async function heartbeatTask(
   client: SqlExecutor,
   lease: TaskLease,
   leaseFor?: Duration,
-): Promise<boolean> {
+): Promise<HeartbeatResult> {
   const result = await client.query(
     `
-    UPDATE ${SCHEMA_NAME}.task
+    UPDATE ${SCHEMA_NAME}.task AS t
        SET lease_until = now() + make_interval(secs => $3::double precision / 1000)
-     WHERE id = $1::bigint AND fence = $2::bigint AND lease_owner IS NOT NULL
-    RETURNING id
+      FROM ${SCHEMA_NAME}.run AS r
+     WHERE t.id = $1::bigint
+       AND t.fence = $2::bigint
+       AND t.lease_owner IS NOT NULL
+       AND r.id = t.run_id
+    RETURNING r.cancel_requested_at
     `,
     [lease.taskId, lease.fence, leaseMilliseconds(leaseFor)],
   );
 
-  return result.rows.length === 1;
+  const row = (result.rows as { cancel_requested_at: Date | null }[])[0];
+  if (row === undefined) {
+    return { held: false, cancelRequested: false };
+  }
+  return { held: true, cancelRequested: row.cancel_requested_at !== null };
+}
+
+/**
+ * Ask a run to stop.
+ *
+ * Cooperative by design. If nobody holds the run it is closed as `cancelled`
+ * immediately and its task removed. If a worker does hold it, the request is
+ * recorded and that worker unwinds at its next heartbeat or step boundary —
+ * because yanking a run away from a worker mid-step would not stop the step,
+ * it would only stop anyone hearing how it ended.
+ *
+ * A step already in flight still finishes and is still recorded. Cancellation
+ * takes effect between steps, or inside one that honours `ctx.signal`.
+ */
+export async function cancelRun(
+  client: SqlExecutor,
+  runId: string,
+  reason?: string,
+): Promise<CancelResult> {
+  const result = await client.query(
+    `
+    WITH idle AS (
+      SELECT t.id
+        FROM ${SCHEMA_NAME}.task AS t
+       WHERE t.run_id = $1::uuid
+         AND (t.lease_owner IS NULL OR t.lease_until < now())
+    ), requested AS (
+      -- One UPDATE, not two. Postgres silently skips a second update of the
+      -- same row within one statement, so recording the request and closing
+      -- the run have to happen in the same assignment list.
+      UPDATE ${SCHEMA_NAME}.run AS r
+         SET cancel_requested_at = COALESCE(r.cancel_requested_at, now()),
+             cancel_reason       = COALESCE(r.cancel_reason, $2),
+             status = CASE
+                        WHEN EXISTS (SELECT 1 FROM idle)
+                        THEN 'cancelled'::${SCHEMA_NAME}.run_status
+                        ELSE r.status
+                      END,
+             closed_at = CASE
+                           WHEN EXISTS (SELECT 1 FROM idle) THEN now()
+                           ELSE r.closed_at
+                         END
+       WHERE r.id = $1::uuid AND r.closed_at IS NULL
+      RETURNING r.id, r.closed_at
+    ), removed AS (
+      DELETE FROM ${SCHEMA_NAME}.task
+       WHERE run_id = (SELECT id FROM requested WHERE closed_at IS NOT NULL)
+      RETURNING id
+    )
+    SELECT (SELECT count(*)::int FROM requested) AS requested,
+           (SELECT count(*)::int FROM removed)   AS removed,
+           (SELECT count(*)::int FROM ${SCHEMA_NAME}.run WHERE id = $1::uuid) AS present
+    `,
+    [runId, reason ?? null],
+  );
+
+  const row = (result.rows as { requested: number; removed: number; present: number }[])[0];
+  if (row === undefined || row.present === 0) {
+    return "not-found";
+  }
+  if (row.requested === 0) {
+    return "already-closed";
+  }
+  return row.removed === 1 ? "cancelled" : "requested";
 }
 
 /**
@@ -481,7 +576,8 @@ export async function getRun(
   const result = await client.query(
     `
     SELECT id, workflow_name, workflow_id, status, input, output, error,
-           stall_reason, journal_len, created_at, closed_at
+           stall_reason, journal_len, created_at, closed_at,
+           cancel_requested_at, cancel_reason
       FROM ${SCHEMA_NAME}.run
      WHERE id = $1::uuid
     `,
@@ -505,6 +601,8 @@ export async function getRun(
     journalLen: row.journal_len,
     createdAt: row.created_at,
     closedAt: row.closed_at,
+    cancelRequestedAt: row.cancel_requested_at,
+    cancelReason: row.cancel_reason,
   };
 }
 
@@ -530,6 +628,8 @@ interface RunRow {
   journal_len: number;
   created_at: Date;
   closed_at: Date | null;
+  cancel_requested_at: Date | null;
+  cancel_reason: string | null;
 }
 
 function leaseMilliseconds(leaseFor: Duration | undefined): number {

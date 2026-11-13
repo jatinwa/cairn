@@ -1,4 +1,9 @@
-export { executeTask, type ExecuteDeps, type ExecutionOutcome } from "./execute.js";
+export {
+  executeTask,
+  type ExecuteDeps,
+  type ExecuteOptions,
+  type ExecutionOutcome,
+} from "./execute.js";
 
 export {
   createWorker,
@@ -58,6 +63,7 @@ export {
 } from "./migrate.js";
 
 export {
+  cancelRun,
   claimTasks,
   closeRun,
   deleteTask,
@@ -69,10 +75,12 @@ export {
   startRun,
   DEFAULT_CLAIM_LIMIT,
   DEFAULT_LEASE,
+  type CancelResult,
   type ClaimOptions,
   type ClaimedTask,
   type CloseRunOptions,
   type ClosedRunStatus,
+  type HeartbeatResult,
   type ReleaseOptions,
   type RunRecord,
   type RunStatus,

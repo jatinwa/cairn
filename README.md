@@ -73,6 +73,18 @@ A step may take far longer than the lease: the worker heartbeats it while it run
 lease is there to notice a worker that **died**, not one that is slow. On shutdown,
 `worker.stop()` stops claiming and waits for work in flight.
 
+To stop a run:
+
+```ts
+await cancelRun(pool, runId, "customer changed their mind");
+```
+
+A run nobody is working on stops immediately. One a worker is holding is *asked* to stop and
+unwinds at its next step boundary — or sooner, if the running step passes `ctx.signal` to
+whatever it is waiting on. A step already in flight is never killed: it finishes, and its
+result is recorded, because stopping a workflow should not mean losing track of a charge that
+already went through.
+
 Give the worker a connection **pool**, not a single client. Heartbeats overlap the queries of
 the task they are keeping alive, so a worker always has more than one query in flight even at
 `concurrency: 1`.
@@ -108,6 +120,7 @@ does not silently retry forever.
 | `workflow.ts` | `defineWorkflow`, and the `step()` and `sleep()` primitives |
 | `execute.ts` | `executeTask`, which runs one claimed task to its next suspension point |
 | `worker.ts` | `createWorker` — polling, heartbeating, concurrency, graceful shutdown |
+| `store.ts` → `cancelRun` | Cooperative cancellation, with `ctx.signal` reaching a running step |
 
 The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
 collide with your own `run`, `step` or `task` tables. Migrating takes any client with a
@@ -122,8 +135,8 @@ await client.connect();
 await migrate(client); // safe to call on every boot
 ```
 
-Still to come: cancellation, OpenTelemetry spans, continue-as-new for long journals, payload
-offloading and the retention sweep, and a CLI.
+Still to come: OpenTelemetry spans, continue-as-new for long journals, payload offloading and
+the retention sweep, and a CLI.
 
 ## Development
 
