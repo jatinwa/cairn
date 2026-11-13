@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { parseDuration, type Duration } from "./duration.js";
 import { InvalidArgumentError } from "./errors.js";
-import { executeTask, type ExecutionOutcome } from "./execute.js";
+import { executeTask, type ExecuteDeps, type ExecutionOutcome } from "./execute.js";
 import type { SqlExecutor } from "./sql.js";
 import {
   claimTasks,
@@ -13,6 +13,7 @@ import {
   type ClaimedTask,
   type RunRecord,
 } from "./store.js";
+import type { Tracer } from "./tracing.js";
 import type { RegisteredWorkflow } from "./workflow.js";
 
 export type WorkerEvent =
@@ -57,6 +58,11 @@ export interface WorkerOptions {
   /** Tasks claimed per poll. */
   readonly claimLimit?: number;
   readonly onEvent?: (event: WorkerEvent) => void;
+  /**
+   * Anything shaped like an OpenTelemetry tracer, including one:
+   * `tracer: trace.getTracer("cairn")`. Omit it and nothing is traced.
+   */
+  readonly tracer?: Tracer;
 }
 
 export interface StopOptions {
@@ -98,10 +104,11 @@ export function createWorker(options: WorkerOptions): Worker {
   const pollMs = positiveDuration(options.pollInterval ?? "1s", "pollInterval");
   const emit = options.onEvent ?? (() => undefined);
 
-  const deps = {
+  const deps: ExecuteDeps = {
     client: options.client,
     workflows,
     leaseFor: options.leaseFor ?? DEFAULT_LEASE,
+    ...(options.tracer === undefined ? {} : { tracer: options.tracer }),
   };
 
   const inFlight = new Set<string>();

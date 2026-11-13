@@ -12,6 +12,7 @@ import {
   type RetryPolicy,
 } from "./retry.js";
 import type { SqlExecutor } from "./sql.js";
+import type { Tracer } from "./tracing.js";
 
 export interface WorkflowContext {
   readonly runId: string;
@@ -98,6 +99,7 @@ export interface ExecutionState {
   readonly inFlight: Map<string, number>;
   /** Aborted when this run has been asked to stop. */
   readonly signal: AbortSignal;
+  readonly tracer: Tracer;
   suspend(suspension: Suspension): void;
   /**
    * Set when the engine's own bookkeeping failed. Recorded here rather than
@@ -209,10 +211,26 @@ export async function step<T>(
       ? state.policy
       : resolveRetryPolicy({ ...state.policy, ...options.retry });
 
+  // The span covers `fn` only, and is ended on every path out of this block.
+  // It deliberately does not wrap the whole of `step`, because the suspension
+  // paths below return a promise that never settles — a `finally` around them
+  // would never run, and every sleep would leak an unclosed span.
+  const span = state.tracer.startSpan("cairn.step", {
+    attributes: {
+      "cairn.run_id": state.runId,
+      "cairn.step_key": key,
+      "cairn.step_attempt": attempt,
+    },
+  });
+
   let output: T;
   try {
     output = await fn();
+    span.end();
   } catch (error) {
+    span.recordException(error instanceof Error ? error : String(error));
+    span.end();
+
     // A step that threw because it was aborted has not failed on its merits,
     // so it is not marked failed and not retried. The run is stopping.
     if (state.signal.aborted) {

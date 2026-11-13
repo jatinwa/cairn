@@ -1,4 +1,5 @@
 import type { Duration } from "./duration.js";
+import { inSpan, noopTracer, type Span, type Tracer } from "./tracing.js";
 import { readJournal } from "./journal.js";
 import { resolveRetryPolicy } from "./retry.js";
 import type { SqlExecutor } from "./sql.js";
@@ -24,6 +25,11 @@ export interface ExecuteDeps {
   /** Workflow definitions by name, as a worker registers them. */
   readonly workflows: ReadonlyMap<string, RegisteredWorkflow>;
   readonly leaseFor?: Duration;
+  /**
+   * Anything shaped like an OpenTelemetry tracer, including one. Omit it and
+   * nothing is traced.
+   */
+  readonly tracer?: Tracer;
 }
 
 export type ExecutionOutcome =
@@ -79,12 +85,39 @@ export async function executeTask(
   task: ClaimedTask,
   options: ExecuteOptions = {},
 ): Promise<ExecutionOutcome> {
+  const tracer = deps.tracer ?? noopTracer;
+  return inSpan(
+    tracer,
+    "cairn.execute",
+    {
+      "cairn.run_id": task.runId,
+      "cairn.queue": task.queue,
+      "cairn.task_attempt": task.attempt,
+    },
+    async (span) => {
+      const outcome = await execute(deps, task, options, tracer, span);
+      span.setAttribute("cairn.outcome", outcome.kind);
+      return outcome;
+    },
+  );
+}
+
+async function execute(
+  deps: ExecuteDeps,
+  task: ClaimedTask,
+  options: ExecuteOptions,
+  tracer: Tracer,
+  span: Span,
+): Promise<ExecutionOutcome> {
   const { client, workflows } = deps;
 
   const run = await getRun(client, task.runId);
   if (run === undefined || run.closedAt !== null) {
     return { kind: "fenced" };
   }
+
+  span.setAttribute("cairn.workflow", run.workflowName);
+  span.setAttribute("cairn.workflow_id", run.workflowId);
 
   const definition = workflows.get(run.workflowName);
   if (definition === undefined) {
@@ -124,6 +157,7 @@ export async function executeTask(
     occurrences: new Map(),
     inFlight: new Map(),
     signal: controller.signal,
+    tracer,
     suspend: (next) => {
       if (suspension === undefined) {
         suspension = next;

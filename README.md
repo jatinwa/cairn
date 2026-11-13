@@ -97,6 +97,18 @@ due and that nobody is working on. If it climbs, work is waiting and not being p
 that is invisible to every rate and latency you could measure: a system doing nothing at all
 looks perfectly healthy by those.
 
+Tracing needs no dependency on our side:
+
+```ts
+import { trace } from "@opentelemetry/api";
+
+createWorker({ client: pool, workflows, tracer: trace.getTracer("cairn") });
+```
+
+`Tracer` is a strict subset of OpenTelemetry's own interface, so an OTel tracer satisfies it
+directly — there is no adapter to write. Spans are flat and carry `cairn.run_id` to group
+them; nesting would need OTel's context API, and using that would mean depending on it.
+
 Give the worker a connection **pool**, not a single client. Heartbeats overlap the queries of
 the task they are keeping alive, so a worker always has more than one query in flight even at
 `concurrency: 1`.
@@ -134,6 +146,7 @@ does not silently retry forever.
 | `worker.ts` | `createWorker` — polling, heartbeating, concurrency, graceful shutdown |
 | `store.ts` → `cancelRun` | Cooperative cancellation, with `ctx.signal` reaching a running step |
 | `store.ts` → `queueHealth` | Whether the queue is moving, and the stalled-run counts |
+| `tracing.ts` | The `Tracer` hook — an OpenTelemetry-shaped seam with no dependency |
 
 The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
 collide with your own `run`, `step` or `task` tables. Migrating takes any client with a

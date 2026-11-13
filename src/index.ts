@@ -55,6 +55,14 @@ export {
 export { OPEN_STATUSES_SQL, SCHEMA_NAME, type SqlExecutor } from "./sql.js";
 
 export {
+  noopTracer,
+  type Span,
+  type SpanAttributeValue,
+  type SpanOptions,
+  type Tracer,
+} from "./tracing.js";
+
+export {
   checksumOf,
   loadMigrations,
   migrate,
