@@ -519,6 +519,37 @@ export async function closeRun(
 }
 
 /**
+ * Mark a run as waiting on a durable timer. Returns `false` if the caller does
+ * not own the task.
+ *
+ * Called after the task has been released into the future, which is safe
+ * because a task with a future `available_at` cannot be claimed in the
+ * meantime. If the process dies between the two, the run reads `running` while
+ * it sleeps — cosmetic, and the next claim corrects it through
+ * {@link markRunRunning}.
+ */
+export async function markRunSleeping(
+  client: SqlExecutor,
+  lease: TaskLease,
+): Promise<boolean> {
+  const result = await client.query(
+    `
+    UPDATE ${SCHEMA_NAME}.run
+       SET status = 'sleeping'
+     WHERE id = (
+             SELECT run_id FROM ${SCHEMA_NAME}.task
+              WHERE id = $1::bigint AND fence = $2::bigint
+           )
+       AND status IN ('pending', 'running')
+    RETURNING id
+    `,
+    [lease.taskId, lease.fence],
+  );
+
+  return result.rows.length === 1;
+}
+
+/**
  * Stop a run from being claimed again, recording why. Returns `false` if the
  * caller no longer owns the task.
  *
@@ -604,6 +635,122 @@ export async function getRun(
     cancelRequestedAt: row.cancel_requested_at,
     cancelReason: row.cancel_reason,
   };
+}
+
+export interface QueueHealth {
+  /**
+   * Age in seconds of the oldest task that is due and that nobody is working
+   * on, or `null` when there is no such task.
+   *
+   * This is the number worth alerting on. Design doc §11: if it climbs,
+   * something is wrong no matter what every other metric says — work is
+   * waiting and not being picked up. Rates and latencies all look healthy
+   * while nothing at all is happening.
+   */
+  readonly oldestUnprogressedSeconds: number | null;
+  /** Due, unleased, waiting for a worker. */
+  readonly claimable: number;
+  /** Held by a worker with a live lease. */
+  readonly leased: number;
+  /** Held by a worker whose lease has expired — work a dead worker dropped. */
+  readonly expired: number;
+  /** Waiting for a future moment: a durable sleep or a retry backoff. */
+  readonly scheduled: number;
+  /** Parked, and so never claimable until a human intervenes. */
+  readonly parked: number;
+}
+
+/**
+ * One query's worth of "is the queue moving?".
+ *
+ * Counts every task by the state it is actually in, rather than by a status
+ * column that could disagree with it.
+ */
+export async function queueHealth(
+  client: SqlExecutor,
+  options: { readonly queue?: string } = {},
+): Promise<QueueHealth> {
+  const result = await client.query(
+    `
+    SELECT
+      count(*) FILTER (
+        WHERE lease_owner IS NULL AND available_at <= now()
+      )::int AS claimable,
+      count(*) FILTER (
+        WHERE lease_owner IS NOT NULL AND lease_until >= now()
+      )::int AS leased,
+      count(*) FILTER (
+        WHERE lease_owner IS NOT NULL AND lease_until < now()
+      )::int AS expired,
+      count(*) FILTER (
+        WHERE available_at > now() AND available_at <> 'infinity'
+      )::int AS scheduled,
+      count(*) FILTER (WHERE available_at = 'infinity')::int AS parked,
+      max(extract(epoch FROM now() - available_at)) FILTER (
+        WHERE available_at <= now()
+          AND (lease_owner IS NULL OR lease_until < now())
+      ) AS oldest_unprogressed_seconds
+    FROM ${SCHEMA_NAME}.task
+    WHERE $1::text IS NULL OR queue = $1::text
+    `,
+    [options.queue ?? null],
+  );
+
+  const row = (result.rows as QueueHealthRow[])[0];
+  if (row === undefined) {
+    return {
+      oldestUnprogressedSeconds: null,
+      claimable: 0,
+      leased: 0,
+      expired: 0,
+      scheduled: 0,
+      parked: 0,
+    };
+  }
+
+  return {
+    // `extract(epoch …)` is numeric, which node-postgres returns as a string
+    // rather than lose precision.
+    oldestUnprogressedSeconds:
+      row.oldest_unprogressed_seconds === null
+        ? null
+        : Number(row.oldest_unprogressed_seconds),
+    claimable: row.claimable,
+    leased: row.leased,
+    expired: row.expired,
+    scheduled: row.scheduled,
+    parked: row.parked,
+  };
+}
+
+/**
+ * Open runs that have stopped with a reason, counted by reason — the data
+ * behind `cairn_run_stalled_total` in design doc §11.
+ */
+export async function stalledRunCounts(
+  client: SqlExecutor,
+): Promise<ReadonlyMap<string, number>> {
+  const result = await client.query(
+    `
+    SELECT stall_reason, count(*)::int AS count
+      FROM ${SCHEMA_NAME}.run
+     WHERE stall_reason IS NOT NULL AND closed_at IS NULL
+     GROUP BY stall_reason
+     ORDER BY stall_reason
+    `,
+  );
+
+  const rows = result.rows as { stall_reason: string; count: number }[];
+  return new Map(rows.map((row) => [row.stall_reason, row.count]));
+}
+
+interface QueueHealthRow {
+  claimable: number;
+  leased: number;
+  expired: number;
+  scheduled: number;
+  parked: number;
+  oldest_unprogressed_seconds: string | null;
 }
 
 interface ClaimedTaskRow {

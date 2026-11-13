@@ -6,6 +6,7 @@ import {
   closeRun,
   getRun,
   markRunRunning,
+  markRunSleeping,
   parkRun,
   releaseTask,
   type ClaimedTask,
@@ -212,9 +213,14 @@ async function handleSuspension(
       availableAt: suspension.until,
       attempt: 0,
     });
-    return released
-      ? { kind: "sleeping", until: suspension.until, key: suspension.key }
-      : { kind: "fenced" };
+    if (!released) {
+      return { kind: "fenced" };
+    }
+    // After the release, not before: the task's future `available_at` means
+    // nobody can claim it in between, so there is no window where another
+    // worker's status wins and then loses.
+    await markRunSleeping(deps.client, task);
+    return { kind: "sleeping", until: suspension.until, key: suspension.key };
   }
 
   const availableAt = new Date(Date.now() + suspension.delayMs);

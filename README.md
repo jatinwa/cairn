@@ -85,6 +85,18 @@ whatever it is waiting on. A step already in flight is never killed: it finishes
 result is recorded, because stopping a workflow should not mean losing track of a charge that
 already went through.
 
+To see whether the queue is moving:
+
+```ts
+const health = await queueHealth(pool);
+// { claimable, leased, expired, scheduled, parked, oldestUnprogressedSeconds }
+```
+
+`oldestUnprogressedSeconds` is the one worth alerting on — the age of the oldest task that is
+due and that nobody is working on. If it climbs, work is waiting and not being picked up, and
+that is invisible to every rate and latency you could measure: a system doing nothing at all
+looks perfectly healthy by those.
+
 Give the worker a connection **pool**, not a single client. Heartbeats overlap the queries of
 the task they are keeping alive, so a worker always has more than one query in flight even at
 `concurrency: 1`.
@@ -121,6 +133,7 @@ does not silently retry forever.
 | `execute.ts` | `executeTask`, which runs one claimed task to its next suspension point |
 | `worker.ts` | `createWorker` — polling, heartbeating, concurrency, graceful shutdown |
 | `store.ts` → `cancelRun` | Cooperative cancellation, with `ctx.signal` reaching a running step |
+| `store.ts` → `queueHealth` | Whether the queue is moving, and the stalled-run counts |
 
 The schema lives in `migrations/`, inside a dedicated `cairn` Postgres schema so it cannot
 collide with your own `run`, `step` or `task` tables. Migrating takes any client with a
