@@ -49,6 +49,14 @@ describe("loadMigrations", () => {
     expect(first.name).toBe("init");
   });
 
+  it("carries every migration, not just the first", () => {
+    expect(migrations.map((migration) => migration.version)).toEqual(["001", "002"]);
+    expect(migrations.map((migration) => migration.name)).toEqual([
+      "init",
+      "cancellation",
+    ]);
+  });
+
   it("checksums each migration from its own SQL", () => {
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumOf(migration.sql));
